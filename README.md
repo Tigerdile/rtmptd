@@ -23,14 +23,35 @@ https://github.com/civetweb/civetweb/
 
 # REQUIREMENTS
 
-Civetweb as noted.  Thread Building Blocks and Boost Random are also required.
+Civetweb as noted.  Boost Random is also required.
 
 # BUILDING
+```
 cmake .
 make
+```
 
-I put about 2 seconds into the build process here so some assembly
-will be required :)  I'm not planning on Windows support, but it
-should compile cleanly on Windows if you want to go on that
-adventure yourself.
+Right now, it assumes civetweb-1.9.1 is in a sibling directory to your checkout of this.  My build process needs to be more configurable, but its unlikely I will bother in the near future unless there's some demand for it.
+
+I'm not planning on Windows support, but it should compile cleanly on Windows if you want to go on that adventure yourself.
+
+# RUNNING
+It will build 'rtmptd' in the 'src' directory.  Copy it where you want.  It requires two arguments; a host and a password of the RTMP server you are proxying.  There are, additionally, optional arguments:
+
+```
+rtmptd RtmpServer RtmpPort NumberOfThreads Listening_Ports ErrorLogFile
+```
+
+* RtmpServer and RtmpPort are are noted above -- RTMP is usually on port 1935
+* NumberOfThreads is the number of CivetWeb threads that will be launched.  CivetWeb, unfortunately, is a thread hog.  Each connection 'owns' a thread, and CivetWeb launches all NumberOfThreads right off the bat.  Instead of spinning threads as needed, if you make this, say, "100" it will go ahead and kick off 102 threads (Civet uses a couple of extra threads for itself).
+
+I'd love to see Civet use either a smart polling mechanism or a more dynamic thread pool; I wouldn't be surprised if that was on their request queue.  But, for now, this is what we've got!
+
+This defaults to 50.
+* Listening_ports is a string that can be whatever Civet supports.  This is how you control the IP and port binding of the RTMPT proxy.  See:
+
+https://github.com/civetweb/civetweb/blob/master/docs/UserManual.md
+
+There's a section on 'listening_ports' that explains it.  Defaults to 8080
+* ErrorLogFile is a file name for error logs.  This defaults to "error.txt" in the current working directory.
 
