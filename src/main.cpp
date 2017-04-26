@@ -1,8 +1,7 @@
 /*
  * rtmptd
  *
- * Simple RTMPT Proxy using Civetweb server, Boost Random, and 
- * Thread Building Blocks
+ * Simple RTMPT Proxy using Civetweb server and Boost Random
  *
  * By sconley 2017 - Released under MIT license
  *
@@ -31,21 +30,21 @@
 
 #include <string>
 #include <chrono>
-#include <map>
+#include <unordered_map>
 #include <stdexcept>
 #include <iostream>
 #include <vector>
+#include <mutex>
 
 #include <unistd.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <time.h>
 
 #include <boost/random/mersenne_twister.hpp>
 #include <boost/random/uniform_int.hpp>
-
-#include <tbb/concurrent_hash_map.h>
 
 #include <CivetServer.h>
 
@@ -73,7 +72,7 @@ class RTMPConnection
          */
 
         int             sock;               // Our socket
-        uint32_t        session_id;         // RTMP session ID
+        uint64_t        session_id;         // RTMP session ID
         char            delay;              // Delay sequence count
         milliseconds    lastAccessTime;     // Last access time
 
@@ -83,7 +82,7 @@ class RTMPConnection
          * The session ID is required to make cleaning up
          * RTMPConnections easier.
          */
-        RTMPConnection(int sock, uint32_t session_id) noexcept
+        RTMPConnection(int sock, uint64_t session_id) noexcept
         {
             this->sock = sock;
             this->session_id = session_id;
@@ -191,31 +190,71 @@ class RTMPServer
         /*
          * Clean up our memory allocation.
          *
-         * This does NOT clean up generated RTMPConnections which
-         * would probably be a cool addition to this.
          */
         ~RTMPServer() noexcept
         {
             if(this->servinfo) {
                 freeaddrinfo(this->servinfo);
             }
+
+            for(auto it : this->sessions) {
+                if(it.second) {
+                    delete it.second;
+                }
+            }
+        }
+
+        /*
+         * Generate a session ID
+         *
+         * The sessionID should be unique for a given second.  If
+         * it isn't ... wow, life sucks, but someone will have to
+         * re-load their client.
+         */
+        uint64_t createSessionId() noexcept
+        {
+            // Generate session ID
+            uint64_t                session_id;
+            uint32_t                now;
+            boost::random::mt19937  rng;
+            boost::random::uniform_int_distribution<uint32_t> range =
+                boost::random::uniform_int_distribution<uint32_t>();
+
+            // Make the high bytes the system time, and the low
+            // bytes will be a 32 bit random number.
+            now = time(NULL);
+
+            memcpy(&session_id, &now, 4);
+
+            // Make sure it is unique.
+            while(1) {
+                now = range(rng);
+
+                // set the random number to the higher bytes
+                memcpy((&session_id)+4, &now, 4);
+
+                // Check it
+                if(!this->sessions.count(session_id)) {
+                    break;
+                }
+            }
+
+            return session_id;
         }
 
         /*
          * Attempts to connect to our RTMP server and creates an
-         * RTMPConnection attached to the resulting socket.
-         *
-         * Consumes a session ID which is produced at this time
-         * by open(...) though I suppose might make more sense
-         * in this classs.
+         * RTMPConnection attached to the resulting socket.  Returns
+         * a session ID.
          *
          * Throws runtime_error if we could not connect to
          * RTMP host for some reason.
          */
-        RTMPConnection* connect(uint32_t session_id)
+        uint64_t connect()
         {
             int sock;
             struct addrinfo *p;
+            RTMPConnection  *con;
 
             // Connect
             for(p = servinfo; p; p = p->ai_next) {
@@ -238,11 +277,146 @@ class RTMPServer
                 throw std::runtime_error("Could not connect to RTMP host!");
             }
 
-            return new RTMPConnection(sock, session_id);
+            // Allocate a session and add it to our list.
+            this->mtx.lock();
+            con = new RTMPConnection(sock, this->createSessionId());
+            this->sessions[con->session_id] = con;
+            this->mtx.unlock();
+
+            return con->session_id;
         }
 
+        /*
+         * Check out a connection.  This will ensure we don't clean it up
+         * while it's in use, but please return it (or delete it!)
+         *
+         * Returns NULL if no session, which is probably an error.
+         */
+        RTMPConnection* checkout(uint64_t session_id) noexcept
+        {
+            RTMPConnection  *con = NULL;
+
+            this->mtx.lock();
+
+            try {
+                con = this->sessions.at(session_id);
+                this->sessions.erase(session_id);
+            } catch(std::out_of_range& e) {
+            }
+
+            this->mtx.unlock();
+            return con;
+        }
+
+        /*
+         * Check out a connection by parsing the information out of
+         * an mg_connection structure.  Uses mg_cry to set error
+         * messages -- if a NULL is returned, just 500 and go.
+         */
+        RTMPConnection* checkout(struct mg_connection* conn)
+        {
+            const struct mg_request_info*       req;
+            std::string                         whole_uri;
+            std::string                         id;
+            uint64_t                            session_id;
+
+            req = mg_get_request_info(conn);
+
+            // This probably shouldn't be null, but it might be, so check it
+            if((!req) || (!req->local_uri)) {
+                mg_cry(
+                 conn,
+                 "Got a null req when trying to locate session .. what do I do?"
+                );
+                return NULL;
+            }
+
+            // parse out our session ID -- C++ strings makes life easier.
+            whole_uri = req->local_uri;
+
+            if(whole_uri.size() < 7) {
+                mg_cry(conn, "Got a send without session ID: %s", req->local_uri);
+                return NULL;
+            }
+
+            /*
+             * Parse out the ID.  Its a little fragile in that if the URL does not
+             * precisely conform to spec, we won't be able to extract the session ID
+             * That being said -- we really don't care if a malformed URL doesn't
+             * work out right, they should 500 anyway.
+             */
+            if(req->local_uri[5] == '/') { // open, idle, send
+                id = whole_uri.substr(6);
+            } else { // close
+                id = whole_uri.substr(7);
+            }
+
+            // parse it... stoull shouldn't care about trailing slash, etc.
+            try {
+                session_id = std::stoull(id);
+            } catch(std::invalid_argument& e) {
+                mg_cry(conn, "Got invalid session: %s (%s)", id.c_str(), e.what());
+                return NULL;
+            }
+
+            // Route it to regular checkout
+            return this->checkout(session_id);
+        }
+
+        /*
+         * Return a RTMPConnection to the list.
+         */
+        void checkin(RTMPConnection* con) noexcept
+        {
+            this->mtx.lock();
+            this->sessions[con->session_id] = con;
+            this->mtx.unlock();
+        }
+
+        /*
+         * Runs cleanup, rolls through the list and removes any stale
+         * RTMP connections.
+         *
+         * This locks the mutex so won't be very efficient for high
+         * numbers of connections.  TODO: Make more efficient ?  Is
+         * it worth while to do so?
+         */
+        void cleanup() noexcept
+        {
+            // What's our timeout?
+            milliseconds timeout = duration_cast<milliseconds> (
+                std::chrono::system_clock::now().time_since_epoch()
+            );
+
+            // subtract 5 seconds -- TODO: make this configurable
+            timeout -= milliseconds(5000);
+
+            this->mtx.lock();
+
+            auto it = this->sessions.begin();
+            while(it != this->sessions.end()) {
+                if((!it->second) || (it->second->lastAccessTime < timeout)) {
+                    delete it->second;
+                    it->second = NULL;
+                    it = this->sessions.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            this->mtx.unlock();
+        }
+         
+
     private:
-        struct addrinfo*    servinfo;       // Resolved server info
+        // Resolved server info
+        struct addrinfo*                                servinfo;
+
+        // Our session map
+        std::unordered_map<uint64_t, RTMPConnection*>   sessions;
+
+        // Our mutex for the session map
+        std::mutex                                      mtx;
 };
 
 
@@ -251,12 +425,6 @@ class RTMPServer
  * GLOBAL VARIABLES
  *
  *************************************************************************/
-
-// This is a concurrent hash map of our sessions, mapping session ID numbers
-// to RTMPConnections.  RTMPConnection may be NULL for 'tombstones' we want
-// the main loop garbage collector to remove, so do not assume it is set.
-typedef tbb::concurrent_hash_map<uint32_t, RTMPConnection*> session_table_t;
-static session_table_t sessions;
 
 // Our RTMP server connector!  Global for the connect method mostly
 static RTMPServer* server;
@@ -270,9 +438,11 @@ static RTMPServer* server;
 
 
 /*
- * This is a generic error handler just to send a 500
+ * This is a generic error handler just to send a 500.  rtmp can be NULL;
+ * if its not, we'll free it.
  */
-static int send_error_response(struct mg_connection *conn)
+static int send_error_response(struct mg_connection *conn,
+                               RTMPConnection* rtmp)
 {
     mg_printf(conn,
               "HTTP/1.1 500 SERVER ERROR\r\n"
@@ -280,74 +450,11 @@ static int send_error_response(struct mg_connection *conn)
               "Content-Length: 0\r\n"
               "Cache-Control: no-cache\r\n\r\n");
 
-    // The docs says this is not valid, but my reading of code
-    // suggests that it is.
-    mg_close_connection(conn);
-
-    // TODO: clean up session here
+    if(rtmp) {
+        delete rtmp;
+    }
 
     return 500;
-}
-
-/*
- * Get an RTMPConnection from a mg_connection, or NULL on error.
- * Will set mg_cry accordingly -- just send 500 on NULL
- */
-static RTMPConnection* get_rtmp_from_session(struct mg_connection* conn)
-{
-    uint32_t                            session_id;
-    const struct mg_request_info*       req;
-    RTMPConnection*                     con;
-
-    req = mg_get_request_info(conn);
-
-    // If this is null, weird
-    if((!req) || (!req->local_uri)) {
-        mg_cry(conn,
-               "Got a null req when trying to locate session .. what do I do?");
-        return NULL;
-    }
-
-    // parse out our session ID -- C++ strings makes life easier.
-    std::string whole_uri = req->local_uri;
-
-    if(whole_uri.size() < 7) {
-        mg_cry(conn, "Got a send without session ID: %s", req->local_uri);
-        return NULL;
-    }
-
-    std::string id;
-
-    // This is 'fragile', but it will 500 on people monkeying with the URL
-    // which is fine by me.
-    if(req->local_uri[5] == '/') { // open, idle, send
-        id = whole_uri.substr(6);
-    } else { // close
-        id = whole_uri.substr(7);
-    }
-
-    // Convert to uint -- stoul doesn't care about trailing slash, etc.
-    try {
-        session_id = std::stoul(id);
-    } catch(std::invalid_argument& e) {
-        mg_cry(conn, "Got invalid session: %s (%s)", id.c_str(), e.what());
-        return NULL;
-    }
-
-    // Make sure we have it
-    {
-        session_table_t::const_accessor access;
-
-        if((!sessions.find(access, session_id)) || (!access->second)) {
-            mg_cry(conn, "Unknown session ID: %s", id.c_str());
-            return NULL;
-        }
-
-        con = access->second;
-        access.release();
-    }
-
-    return con;
 }
 
 /*
@@ -371,44 +478,19 @@ static int fcs_ident_handler(struct mg_connection *conn, void *ignored)
  */
 static int open_handler(struct mg_connection *conn, void *ignored)
 {
-    uint32_t        session_id;
+    uint64_t        session_id;
     int             err;
-    RTMPConnection* con;
-
-    // Generate session ID
-    boost::random::mt19937 rng;
-    boost::random::uniform_int_distribution<uint32_t> range =
-        boost::random::uniform_int_distribution<uint32_t>();
-
-    // Make sure it is unique.
-    while(1) {
-        session_id = range(rng);
-        session_table_t::accessor access;
-
-        if(!sessions.find(access, session_id)) {
-            // Add in a null to keep the slot open in case of concurrent access
-            sessions.insert(access, session_id);
-            access->second = NULL;
-            access.release();
-            break;
-        }
-    }
 
     // Make our session
     try {
-        con = server->connect(session_id);
+        session_id = server->connect();
     } catch(std::runtime_error& e) {
-        // Main loop will clean up our session NULL.
+        // Disable warning that's just on this line
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-security"
         mg_cry(conn, e.what());
-        return send_error_response(conn);
-    }
-
-    // Push it into our map.
-    {
-        session_table_t::accessor access;
-        sessions.insert(access, session_id);
-        access->second = con;
-        access.release();
+#pragma clang diagnostic pop
+        return send_error_response(conn, NULL);
     }
 
     // Convert integer to string
@@ -437,31 +519,31 @@ static int idle_handler(struct mg_connection *conn, void *ignored)
     // Started this out using a C++ vector but it was causing frame
     // errors -- not sure why.  Maybe my awkward mix of C and C++.
     // Switched to using a regular ole C buffer.
-    RTMPConnection*                     con;
+    RTMPConnection*                     rtmp;
     char                                buf[16384];
     int                                 size;
     size_t                              total_read = 0;
     char*                               superBuf = NULL;
     size_t                              superSize = 0;
 
-    con = get_rtmp_from_session(conn);
+    rtmp = server->checkout(conn);
 
-    if(!con) {
-        return send_error_response(conn);
+    if(!rtmp) {
+        return send_error_response(conn, NULL);
     }
 
-    while(con->hasData()) {
+    while(rtmp->hasData()) {
         // read
-        size = recv(con->sock, buf, 16383, 0);
+        size = recv(rtmp->sock, buf, 16383, 0);
 
         if(size == 0) {
             // show's over, folks
             mg_cry(conn, "Remote connection closed");
-            return send_error_response(conn);
+            return send_error_response(conn, rtmp);
         } else if(size < 0) {
             // show's still over, folks.
             mg_cry(conn, "Remote connection error");
-            return send_error_response(conn);
+            return send_error_response(conn, rtmp);
         }
 
         total_read += size;
@@ -476,9 +558,9 @@ static int idle_handler(struct mg_connection *conn, void *ignored)
 
     // Book keeping
     if(total_read) {
-        con->resetEmpty();
+        rtmp->resetEmpty();
     } else {
-        con->increaseEmpty();
+        rtmp->increaseEmpty();
     }
 
     mg_printf(conn,
@@ -490,10 +572,11 @@ static int idle_handler(struct mg_connection *conn, void *ignored)
               "Content-Length: %lu\r\n\r\n",
               superSize+1);
 
-    mg_write(conn, &con->delay, 1);
+    mg_write(conn, &rtmp->delay, 1);
     mg_write(conn, superBuf, superSize);
 
     free(superBuf);
+    server->checkin(rtmp); // return it.
 
     return 200;
 }
@@ -504,14 +587,14 @@ static int idle_handler(struct mg_connection *conn, void *ignored)
  */
 static int send_handler(struct mg_connection *conn, void *ignored)
 {
-    RTMPConnection*                     con;
+    RTMPConnection*                     rtmp;
     char                                buf[8192];
     size_t                              size;
 
-    con = get_rtmp_from_session(conn);
+    rtmp = server->checkout(conn);
 
-    if(!con) {
-        return send_error_response(conn);
+    if(!rtmp) {
+        return send_error_response(conn, NULL);
     }
 
     // Get data and push to RTMP
@@ -523,17 +606,21 @@ static int send_handler(struct mg_connection *conn, void *ignored)
 
         // Send it all.
         while(total < size) {
-            n = send(con->sock, buf+total, bytesleft, 0);
+            n = send(rtmp->sock, buf+total, bytesleft, 0);
 
             if(n == -1) {
                 mg_cry(conn, "Lost connection while sending!");
-                return send_error_response(conn);
+                return send_error_response(conn, rtmp);
             }
 
             total += n;
             bytesleft -= n;
         }
     }
+
+    // Silly to check back in just to check out again.
+    // TODO: keep checked out?
+    server->checkin(rtmp);
 
     // Route to idle handler after data is sent.  Handling is
     // the same from that point.
@@ -545,16 +632,15 @@ static int send_handler(struct mg_connection *conn, void *ignored)
  */
 static int close_handler(struct mg_connection *conn, void *ignored)
 {
-    RTMPConnection* con;
+    RTMPConnection* rtmp;
 
-    con = get_rtmp_from_session(conn);
+    rtmp = server->checkout(conn);
 
-    if(!con) {
-        return send_error_response(conn);
+    if(!rtmp) {
+        return send_error_response(conn, NULL);
     }
 
-    sessions.erase(con->session_id);
-    delete con;
+    delete rtmp;
 
     mg_printf(conn,
               "HTTP/1.1 200 OK\r\n"
@@ -566,10 +652,6 @@ static int close_handler(struct mg_connection *conn, void *ignored)
     );
 
     mg_write(conn, "\0", 1);
-
-    // The docs says this is not valid, but my reading of code
-    // suggests that it is.
-    mg_close_connection(conn);
 
     return 200;
 }
@@ -659,7 +741,9 @@ int main(int argc, char** argv, char** envp)
 
     while(1) {
         sleep(60);
-        // TODO: add session cleanup ?
+
+        // run cleanup
+        server->cleanup();
     }
 
     // Code will never get here.  But in case we ever want a legit
