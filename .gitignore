@@ -34,3 +34,6 @@ CMakeFiles/*
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+
+# our built file
+rtmptd

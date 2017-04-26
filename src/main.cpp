@@ -359,7 +359,7 @@ static int fcs_ident_handler(struct mg_connection *conn, void *ignored)
     // This is totally ignored
     mg_printf(conn,
               "HTTP/1.1 200 OK\r\n"
-              "Connection: Close\r\n"
+              "Connection: Keep-Alive\r\n"
               "Content-Length: 0\r\n"
               "Cache-Control: no-cache\r\n\r\n");
 
@@ -417,7 +417,7 @@ static int open_handler(struct mg_connection *conn, void *ignored)
     mg_printf(conn,
               "HTTP/1.1 200 OK\r\n"
               "Content-Type: application/x-fcs\r\n"
-              "Connection: Close\r\n" // TODO: Keepalive?
+              "Connection: Keep-Alive\r\n"
               "Cache-Control: no-cache\r\n"
               "Content-Type: text/plain\r\n"
               "Content-Length: %lu\r\n\r\n",
@@ -484,7 +484,7 @@ static int idle_handler(struct mg_connection *conn, void *ignored)
     mg_printf(conn,
               "HTTP/1.1 200 OK\r\n"
               "Content-Type: application/x-fcs\r\n"
-              "Connection: Close\r\n" // TODO: Keepalive?
+              "Connection: Keep-Alive\r\n"
               "Cache-Control: no-cache\r\n"
               "Content-Type: text/plain\r\n"
               "Content-Length: %lu\r\n\r\n",
