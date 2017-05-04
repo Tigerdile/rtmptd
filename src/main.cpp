@@ -29,6 +29,7 @@
  */
 
 #include <string>
+#include <cstring>
 #include <chrono>
 #include <unordered_map>
 #include <stdexcept>
@@ -688,10 +689,11 @@ int main(int argc, char** argv, char** envp)
         return -1;
     }
 
+    options = (const char**)malloc(sizeof(const char*) * (argc));
+    int j = 0;
+
     // These are civet arguments.
     if(argc > 3) {
-        options = (const char**)malloc(sizeof(const char*) * (argc-2));
-        int j = 0;
 
         // Parse 'em
         for(int i = 3; i < argc; i+=2) {
@@ -700,7 +702,8 @@ int main(int argc, char** argv, char** envp)
                 struct group* myGroup = getgrnam(argv[i+1]);
 
                 if(!myGroup) {
-                    std::cerr << "Unknown group: " << argv[i+1];
+                    std::cerr << "Unknown group: " << argv[i+1]
+                              << std::endl;
                     return -1;
                 }
 
@@ -708,15 +711,21 @@ int main(int argc, char** argv, char** envp)
                     perror("Could not set group");
                     return -1;
                 }
+            } else if(!strcmp(argv[i], "enable_keep_alive")) {
+                // ignore this parameter -- we will add it
+                continue;
             } else {
                 options[j] = argv[i];
                 options[++j] = argv[i+1];
                 j++;
             }
         }
-
-        options[j] = NULL;
     }
+
+    // add keep alive
+    options[j] = "enable_keep_alive";
+    options[++j] = "yes";
+    options[++j] = NULL;
 
     // init library - use IPv6
     mg_init_library(8);
@@ -734,7 +743,7 @@ int main(int argc, char** argv, char** envp)
         server = new RTMPServer(argv[1], argv[2]);
     } catch(std::runtime_error& e) {
         // Probably couldn't resolve host.
-        std::cerr << e.what();
+        std::cerr << e.what() << std::endl;
         mg_stop(ctx);
         mg_exit_library();
         return (int) -1;
@@ -764,5 +773,8 @@ int main(int argc, char** argv, char** envp)
 
     // Un-init
     mg_exit_library();
+
+    free(options);
+
     return (int) 0;
 }
