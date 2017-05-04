@@ -42,6 +42,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <time.h>
+#include <grp.h>
 
 #include <boost/random/mersenne_twister.hpp>
 #include <boost/random/uniform_int.hpp>
@@ -663,61 +664,70 @@ static int close_handler(struct mg_connection *conn, void *ignored)
  *
  * * RTMP Server Host (required)
  * * RTMP Server Port (required)
- * * Number of threads (default 50)
- * * listening_ports setting (default 8080)
- * * error_log_file (default error.txt)
+ *
+ * And then anything civet supports, in key then value sequence
+ *
+ * We add a 'run_as_group' option that civet doesn't support.
  */
 int main(int argc, char** argv, char** envp)
 {
     // Settings
-    const char*       num_threads = "50";
-    const char*       listening_ports = "8080";
-    const char*       error_log_file = "error.txt";
-    const char*       options[11];
+    const char**      options = NULL;
 
     // server context
     struct mg_context   *ctx;
 
     // Parse arguments
-    switch(argc) {
-        case 6:
-            error_log_file = argv[5];
-        case 5:
-            listening_ports = argv[4];
-        case 4:
-            num_threads = argv[3];
-        case 3:
-            break;
-        default:
-            std::cerr << "Syntax: " << argv[0]
-                                    << " RemoteServerHost"
-                                    << " RemoteServerPort"
-                                    << " [num threads]"
-                                    << " [listening_ports]"
-                                    << " [error log file]"
-                                    << std::endl;
-            return -1;
+    if((argc < 3) || (!(argc % 2))) { // invalid
+        std::cerr << "Syntax: " << argv[0]
+                                << " RemoteServerHost"
+                                << " RemoteServerPort"
+                                << " [civet-option civet-value]"
+                                << " [... as many as you want]"
+                                << std::endl;
+        return -1;
     }
 
-    // Stack up our options
-    // Yes, I'm aware this is a dumb way to do it.
-    options[0] = "enable_keep_alive";
-    options[1] = "yes";
-    options[2] = "keep_alive_timeout_ms";
-    options[3] = "500";
-    options[4] = "listening_ports";
-    options[5] = listening_ports;
-    options[6] = "num_threads";
-    options[7] = num_threads;
-    options[8] = "error_log_file";
-    options[9] = error_log_file;
-    options[10] = NULL;
+    // These are civet arguments.
+    if(argc > 3) {
+        options = (const char**)malloc(sizeof(const char*) * (argc-2));
+        int j = 0;
+
+        // Parse 'em
+        for(int i = 3; i < argc; i+=2) {
+            if(!strcmp(argv[i], "run_as_group")) {
+                // we handle this one
+                struct group* myGroup = getgrnam(argv[i+1]);
+
+                if(!myGroup) {
+                    std::cerr << "Unknown group: " << argv[i+1];
+                    return -1;
+                }
+
+                if(setgid(myGroup->gr_gid) < 0) {
+                    perror("Could not set group");
+                    return -1;
+                }
+            } else {
+                options[j] = argv[i];
+                options[++j] = argv[i+1];
+                j++;
+            }
+        }
+
+        options[j] = NULL;
+    }
 
     // init library - use IPv6
     mg_init_library(8);
 
     // start server
     ctx = mg_start(NULL, NULL, options);
+
+    // Make sure it actually started
+    if(!ctx) {
+        return -1;
+    }
 
     // try to connect to server.
     try {
