@@ -39,19 +39,25 @@ I'm not planning on Windows support, but it should compile cleanly on Windows if
 It will build 'rtmptd' in the 'src' directory.  Copy it where you want.  It requires two arguments; a host and a password of the RTMP server you are proxying.  There are, additionally, optional arguments:
 
 ```
-rtmptd RtmpServer RtmpPort NumberOfThreads Listening_Ports ErrorLogFile
+rtmptd RtmpServer RtmpPort [civet option] [civet option value] ...
+```
+
+for instance:
+
+```
+rtmptd localhost 1935 listening_ports 8080 num_threads 30
 ```
 
 * RtmpServer and RtmpPort are are noted above -- RTMP is usually on port 1935
-* NumberOfThreads is the number of CivetWeb threads that will be launched.  CivetWeb, unfortunately, is a thread hog.  Each connection 'owns' a thread, and CivetWeb launches all NumberOfThreads right off the bat.  Instead of spinning threads as needed, if you make this, say, "100" it will go ahead and kick off 102 threads (Civet uses a couple of extra threads for itself).
+* CivetWeb, unfortunately, is a thread hog.  Each connection 'owns' a thread, and CivetWeb launches all num_threads right off the bat.  Instead of spinning threads as needed, if you make this, say, "100" it will go ahead and kick off 102 threads (Civet uses a couple of extra threads for itself).
 
 I'd love to see Civet use either a smart polling mechanism or a more dynamic thread pool; I wouldn't be surprised if that was on their request queue.  But, for now, this is what we've got!
 
-This defaults to 50.
-* Listening_ports is a string that can be whatever Civet supports.  This is how you control the IP and port binding of the RTMPT proxy.  See:
+* Your options can be whatever Civet supports.  See:
 
 https://github.com/civetweb/civetweb/blob/master/docs/UserManual.md
 
-There's a section on 'listening_ports' that explains it.  Defaults to 8080
-* ErrorLogFile is a file name for error logs.  This defaults to "error.txt" in the current working directory.
+There's a section on options that explains it. 
+* Civet is missing a "run_as_group" option, so I added it.  You can "run_as_group whateverName" to run as a certain group name in addition to Civet's "run_as_user" for a specific user name.
+
 
